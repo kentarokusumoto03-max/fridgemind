@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 
 // ─── INGREDIENT TRANSLATION DICTIONARY ───
 const I = {
@@ -184,13 +184,16 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [addMethod, setAddMethod] = useState(null);
   const [notif, setNotif] = useState(null);
-  const [scanning, setScanning] = useState(null);
   const [form, setForm] = useState({ name:"",category:"other",qty:"",unit:"g",expiresIn:7 });
   const [search, setSearch] = useState("");
   const [cuisine, setCuisine] = useState("all");
   const [shopList, setShopList] = useState([]);
   const [showShop, setShowShop] = useState(false);
   const [toggles, setToggles] = useState({ push:true,expiry:true,lowStock:true,metric:true });
+  const fileInputRef = useRef(null);
+  const [scanType, setScanType] = useState(null);
+  const [capturedImage, setCapturedImage] = useState(null);
+  const [processing, setProcessing] = useState(false);
 
   const t = UI[lang]||UI.en;
   const names = items.map(i => i.name.toLowerCase());
@@ -206,14 +209,82 @@ export default function App() {
   const cook = r=>{const u=[...items];r.ingredients.forEach(ing=>{if(!ing.inFridge)return;const idx=u.findIndex(i=>i.name.toLowerCase().includes(ing.name.toLowerCase())||ing.name.toLowerCase().includes(i.name.toLowerCase()));if(idx!==-1){const n=parseInt(ing.amount);if(!isNaN(n))u[idx]={...u[idx],qty:Math.max(0,u[idx].qty-n)}}});setItems(u.filter(i=>i.qty>0));show(t.enjoyMeal);setSelRecipe(null);setScreen("recipes")};
   const addShop = r=>{const m=r.ingredients.filter(i=>!i.inFridge).map(i=>`${iN(i.name,lang)} (${i.amount})`);setShopList(p=>[...new Set([...p,...m])]);show(`${m.length} ${t.addedToShop}`)};
   const addItem = ()=>{if(!form.name||!form.qty)return;setItems([...items,{id:Date.now(),name:form.name,category:form.category,qty:parseInt(form.qty),unit:form.unit,expiresIn:form.expiresIn}]);setForm({name:"",category:"other",qty:"",unit:"g",expiresIn:7});setAddMethod(null);setShowAdd(false);show(`${form.name} ${t.added}`)};
-  const doScan = type=>{setScanning(type);setTimeout(()=>{if(type==="label"){setItems(p=>[...p,{id:Date.now(),name:"Chicken Breast",category:"protein",qty:300,unit:"g",expiresIn:4}]);show(t.labelScanned||"Label scanned! Chicken Breast added with full nutrition data 📸")}else if(type==="receipt"){setItems(p=>[...p,{id:Date.now(),name:"Tofu (Firm)",category:"protein",qty:400,unit:"g",expiresIn:6},{id:Date.now()+1,name:"Green Onion",category:"produce",qty:3,unit:"pcs",expiresIn:5},{id:Date.now()+2,name:"Miso Paste",category:"condiments",qty:300,unit:"g",expiresIn:120}]);show(t.receiptScanned)}else if(type==="fridge"){show(t.fridgeScanned)}else{setItems(p=>[...p,{id:Date.now(),name:"Oat Milk",category:"beverages",qty:1000,unit:"ml",expiresIn:10}]);show(t.barcodeScanned)}setScanning(null);setAddMethod(null);setShowAdd(false)},2200)};
+  const [scanResults, setScanResults] = useState(null);
+  const [scanError, setScanError] = useState(null);
+  const [processingMsg, setProcessingMsg] = useState("");
+
+  const doScan = type=>{setScanType(type);setScanError(null);if(fileInputRef.current){fileInputRef.current.value='';fileInputRef.current.click()}};
+
+  const handlePhoto = (e)=>{
+    const file=e.target.files?.[0];if(!file)return;
+    const reader=new FileReader();
+    reader.onload=async(ev)=>{
+      const base64=ev.target.result;
+      setCapturedImage(base64);setProcessing(true);setShowAdd(false);
+      setProcessingMsg(scanType==="label"?"Reading nutrition label...":scanType==="barcode"?"Analyzing product...":scanType==="receipt"?"Extracting items from receipt...":"Identifying fridge contents...");
+
+      // Try barcode detection first if scan type is barcode
+      if(scanType==="barcode" && typeof BarcodeDetector !== "undefined"){
+        try{
+          const img=new Image();img.src=base64;
+          await new Promise(r=>{img.onload=r});
+          const detector=new BarcodeDetector({formats:["ean_13","ean_8","upc_a","upc_e","code_128","code_39"]});
+          const barcodes=await detector.detect(img);
+          if(barcodes.length>0){
+            setProcessingMsg("Barcode found! Looking up product...");
+            const barcodeValue=barcodes[0].rawValue;
+            try{
+              const resp=await fetch("/api/barcode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({barcode:barcodeValue})});
+              const data=await resp.json();
+              if(data.items&&data.items.length>0){setProcessing(false);setScanResults(data.items);return}
+            }catch(err){console.log("Barcode API failed, falling back to vision")}
+          }
+        }catch(err){console.log("BarcodeDetector not available, using vision fallback")}
+      }
+
+      // For all types (and barcode fallback): send to Claude Vision API
+      try{
+        const apiScanType = scanType==="barcode"?"barcode_fallback":scanType;
+        const resp=await fetch("/api/scan",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({image:base64,scanType:apiScanType})});
+        if(!resp.ok){const err=await resp.json();throw new Error(err.error||"Scan failed")}
+        const data=await resp.json();
+        if(data.items&&data.items.length>0){
+          setProcessing(false);setScanResults(data.items);
+        }else{
+          setProcessing(false);setScanError("Couldn't identify any items. Try a clearer photo.");
+        }
+      }catch(err){
+        console.error("Scan error:",err);
+        setProcessing(false);setScanError(err.message||"Something went wrong. Please try again.");
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const confirmScanResults = ()=>{
+    if(!scanResults)return;
+    const newItems=scanResults.map((item,i)=>({id:Date.now()+i,name:item.name,category:item.category||"other",qty:item.qty||100,unit:item.unit||"g",expiresIn:item.expiresIn||7,calories:item.calories||0,protein:item.protein||0,carbs:item.carbs||0,fat:item.fat||0}));
+    setItems(p=>[...p,...newItems]);
+    show(`${newItems.length} item${newItems.length>1?"s":""} added to your fridge! ✅`);
+    setScanResults(null);setCapturedImage(null);setScanType(null);setAddMethod(null);
+  };
+
+  const dismissScan = ()=>{setScanResults(null);setCapturedImage(null);setScanError(null);setProcessing(false);setScanType(null);};
+  const removeScanItem = (idx)=>{setScanResults(p=>p.filter((_,i)=>i!==idx))};
   const del = id=>{setItems(items.filter(i=>i.id!==id));show(t.removed)};
   const grouped = items.reduce((a,i)=>{if(!a[i.category])a[i.category]=[];a[i.category].push(i);return a},{});
 
   const bg="#F7F5F0",wb="white";
   const S={app:{fontFamily:"'Nunito','Hiragino Sans',sans-serif",background:bg,minHeight:"100vh",maxWidth:430,margin:"0 auto",position:"relative",color:"#2D2A26"},hdr:{background:"linear-gradient(135deg,#2D5016,#4A7C28)",color:"white",padding:"20px 20px 16px",borderRadius:"0 0 24px 24px"},row:{background:wb,borderRadius:14,padding:"12px 16px",marginBottom:6,display:"flex",alignItems:"center",boxShadow:"0 1px 4px rgba(0,0,0,0.04)"},modal:{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.5)",zIndex:200,display:"flex",alignItems:"flex-end",justifyContent:"center"},mc:{background:"white",borderRadius:"24px 24px 0 0",width:"100%",maxWidth:430,padding:"24px 20px 40px",maxHeight:"85vh",overflow:"auto"},b1:{width:"100%",padding:"16px",background:"linear-gradient(135deg,#4A7C28,#2D5016)",color:"white",border:"none",borderRadius:14,fontSize:16,fontWeight:800,cursor:"pointer"},b2:{width:"100%",padding:"14px",background:"none",color:"#8B9DAF",border:"2px solid #E8E4DE",borderRadius:14,fontSize:14,fontWeight:700,cursor:"pointer"},inp:{width:"100%",padding:"12px 16px",border:"2px solid #E8E4DE",borderRadius:12,fontSize:15,fontWeight:600,outline:"none",boxSizing:"border-box",fontFamily:"inherit"},notif:{position:"fixed",top:20,left:"50%",transform:"translateX(-50%)",background:"#2D5016",color:"white",padding:"14px 24px",borderRadius:16,fontSize:14,fontWeight:700,zIndex:999,boxShadow:"0 8px 32px rgba(0,0,0,0.2)",maxWidth:380,textAlign:"center"},fab:{position:"fixed",bottom:90,right:"calc(50% - 195px)",width:56,height:56,borderRadius:28,background:"linear-gradient(135deg,#4A7C28,#2D5016)",color:"white",border:"none",boxShadow:"0 6px 20px rgba(45,80,22,0.4)",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",zIndex:99},nav:{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:"white",display:"flex",justifyContent:"space-around",padding:"8px 0 26px",borderTop:"1px solid #E8E4DE",zIndex:100},ni:{display:"flex",flexDirection:"column",alignItems:"center",gap:2,border:"none",background:"none",cursor:"pointer",fontSize:10,fontWeight:700,padding:"4px 8px"},tgl:{width:48,height:26,borderRadius:13,padding:2,cursor:"pointer",transition:"all 0.2s",border:"none",display:"flex",alignItems:"center"},tglD:{width:22,height:22,borderRadius:11,background:"white",transition:"all 0.2s",boxShadow:"0 1px 3px rgba(0,0,0,0.2)"},sr:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:"1px solid #F0EDE8"}};
 
-  if(scanning)return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",zIndex:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:"white"}}><div style={{width:250,height:250,border:"3px solid #4A7C28",borderRadius:20,position:"relative",overflow:"hidden"}}><div style={{position:"absolute",top:0,left:0,right:0,height:3,background:"#4A7C28",animation:"sm 1.5s ease-in-out infinite"}}/></div><p style={{marginTop:24,fontSize:18,fontWeight:700}}>{scanning==="label"?t.scanningLabel||"Reading nutrition label...":scanning==="barcode"?t.scanningBarcode:scanning==="receipt"?t.scanningReceipt:t.scanningFridge}</p><p style={{fontSize:13,opacity:0.6,marginTop:4}}>{t.scanning}</p><style>{`@keyframes sm{0%,100%{top:0}50%{top:calc(100% - 3px)}}`}</style></div>);
+  // ─── SCAN RESULTS CONFIRMATION ───
+  if(scanResults&&scanResults.length>0)return(<div style={S.app}><link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/><div style={{...S.hdr,paddingBottom:24}}><button style={{display:"flex",alignItems:"center",gap:6,border:"none",background:"none",color:"white",fontSize:14,fontWeight:600,cursor:"pointer",padding:0,marginBottom:12}} onClick={dismissScan}>{Icons.back} {t.back||"Back"}</button><h1 style={{fontSize:22,fontWeight:800,margin:0}}>{scanResults.length} item{scanResults.length>1?"s":""} found</h1><p style={{fontSize:13,opacity:0.7,marginTop:4}}>Review and confirm what to add to your fridge</p></div>{capturedImage&&<div style={{padding:"0 20px",marginTop:16}}><img src={capturedImage} style={{width:"100%",height:140,objectFit:"cover",borderRadius:14,border:"2px solid #E8E4DE"}} alt="scanned"/></div>}<div style={{padding:"16px 20px"}}>{scanResults.map((item,i)=>(<div key={i} style={{background:"white",borderRadius:16,padding:"16px",marginBottom:10,boxShadow:"0 2px 12px rgba(0,0,0,0.06)",border:"1px solid #E8E4DE"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div style={{flex:1}}><div style={{fontSize:16,fontWeight:800,color:"#1a1a1a"}}>{item.name}</div>{item.name_ja&&<div style={{fontSize:12,color:"#8B9DAF",marginTop:2}}>{item.name_ja}</div>}{item.brand&&<div style={{fontSize:11,color:"#B8B3A8",marginTop:1}}>{item.brand}</div>}</div><button style={{border:"none",background:"none",color:"#ccc",cursor:"pointer",padding:4}} onClick={()=>removeScanItem(i)}>{Icons.x}</button></div><div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}><span style={{fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:10,background:"#EFF6E8",color:"#2D5016"}}>{item.qty}{item.unit}</span><span style={{fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:10,background:"#F0E6FF",color:"#6A3EA1"}}>{CATEGORIES[item.category]?.emoji} {item.category}</span>{item.calories>0&&<span style={{fontSize:12,fontWeight:700,padding:"4px 10px",borderRadius:10,background:"#FFF3E0",color:"#E65100"}}>{item.calories} kcal/100{item.unit}</span>}</div>{(item.protein>0||item.carbs>0||item.fat>0)&&<div style={{display:"flex",gap:8,marginTop:8}}>{[["P",item.protein,"#4CAF50"],["C",item.carbs,"#F4A836"],["F",item.fat,"#E85D4A"]].map(([l,v,c])=>v>0&&<span key={l} style={{fontSize:11,fontWeight:700,color:c}}>{l}: {v}g</span>)}</div>}</div>))}</div><div style={{padding:"8px 20px 120px"}}><button style={{width:"100%",padding:16,background:"linear-gradient(135deg,#4A7C28,#2D5016)",color:"white",border:"none",borderRadius:14,fontSize:16,fontWeight:800,cursor:"pointer"}} onClick={confirmScanResults}>Add {scanResults.length} item{scanResults.length>1?"s":""} to Fridge ✓</button><button style={{width:"100%",padding:14,background:"none",color:"#8B9DAF",border:"2px solid #E8E4DE",borderRadius:14,fontSize:14,fontWeight:700,cursor:"pointer",marginTop:10}} onClick={dismissScan}>Cancel</button></div>{notif&&<div style={S.notif}>{notif}</div>}</div>);
+
+  // ─── SCAN ERROR ───
+  if(scanError)return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:"white",padding:20,textAlign:"center"}}><div style={{fontSize:48,marginBottom:20}}>😕</div><p style={{fontSize:20,fontWeight:700,marginBottom:10}}>Scan Failed</p><p style={{fontSize:15,opacity:0.7,maxWidth:300,lineHeight:1.6}}>{scanError}</p><button style={{marginTop:24,padding:"14px 32px",background:"white",color:"#2D5016",border:"none",borderRadius:14,fontSize:16,fontWeight:800,cursor:"pointer"}} onClick={dismissScan}>Try Again</button></div>);
+
+  // ─── PROCESSING OVERLAY ───
+  if(processing&&capturedImage)return(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:300,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",color:"white",padding:20}}><div style={{width:280,height:280,borderRadius:20,overflow:"hidden",border:"3px solid #4A7C28",position:"relative"}}><img src={capturedImage} style={{width:"100%",height:"100%",objectFit:"cover"}} alt="captured"/><div style={{position:"absolute",top:0,left:0,right:0,height:4,background:"linear-gradient(90deg,transparent,#4A7C28,transparent)",animation:"scanH 1.5s ease-in-out infinite"}} /></div><p style={{marginTop:24,fontSize:18,fontWeight:700}}>{processingMsg}</p><p style={{fontSize:13,opacity:0.6,marginTop:4}}>AI is analyzing your photo</p><div style={{marginTop:20,width:200,height:4,borderRadius:2,background:"rgba(255,255,255,0.1)",overflow:"hidden"}}><div style={{height:"100%",background:"#4A7C28",borderRadius:2,animation:"loadBar 8s ease-out forwards"}} /></div><style>{`@keyframes scanH{0%{top:0}50%{top:calc(100% - 4px)}100%{top:0}}@keyframes loadBar{0%{width:0}50%{width:70%}100%{width:95%}}`}</style></div>);
 
   if(selRecipe){const r=selRecipe;const miss=r.ingredients.filter(i=>!i.inFridge);const steps=r.steps[lang]||r.steps.en;
     return(<div style={S.app}><link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/><div style={{...S.hdr,paddingBottom:24}}><button style={{display:"flex",alignItems:"center",gap:6,border:"none",background:"none",color:"white",fontSize:14,fontWeight:600,cursor:"pointer",padding:0,marginBottom:12}} onClick={()=>setSelRecipe(null)}>{Icons.back} {t.back}</button><h1 style={{fontSize:22,fontWeight:800,margin:0}}>{RN[r.id]?.[lang]||RN[r.id]?.en}</h1><div style={{display:"flex",gap:12,marginTop:14}}><span style={{display:"flex",alignItems:"center",gap:4,fontSize:13,opacity:0.9}}>{Icons.clock} {r.time}</span><span style={{fontSize:13,opacity:0.9}}>📊 {r.difficulty}</span><span style={{fontSize:13,opacity:0.9,marginLeft:"auto",background:"rgba(255,255,255,0.2)",padding:"2px 10px",borderRadius:10}}>{r.matchPct}%</span></div></div>
@@ -242,5 +313,5 @@ export default function App() {
   const renderAddModal=()=>{if(!showAdd)return null;return(<div style={S.modal} onClick={e=>e.target===e.currentTarget&&(setShowAdd(false),setAddMethod(null))}><div style={S.mc}>{!addMethod?(<><p style={{fontSize:20,fontWeight:800,marginBottom:20,textAlign:"center"}}>{t.addToFridge}</p>{[["label",Icons.camera,"#EFF6E8","#4A7C28",t.photoLabel||"Photo Label",t.photoLabelDesc||"Snap nutrition label + front of package","Most Accurate","#E8F5E9","#2E7D32"],["barcode",Icons.scan,"#E8F5E9","#4A7C28",t.scanBarcode,t.scanBarcodeDesc,t.quick||"Accurate","#E8F5E9","#2E7D32"],["receipt",Icons.receipt,"#FFF3E0","#F4A836",t.scanReceipt,t.scanReceiptDesc,"Bulk Add","#FFF3E0","#E65100"],["fridge",Icons.camera,"#E3F2FD","#5BA4CF",t.photoFridge,t.photoFridgeDesc,t.estimate,"#E3F2FD","#1565C0"]].map(([type,icon,ibg,ic,title,desc,acc,abg,ac])=>(<button key={type} style={{width:"100%",padding:"16px 20px",background:"#F7F5F0",border:"2px solid #E8E4DE",borderRadius:16,marginBottom:10,display:"flex",alignItems:"center",gap:14,cursor:"pointer",textAlign:"left"}} onClick={()=>doScan(type)}><div style={{width:44,height:44,borderRadius:12,background:ibg,display:"flex",alignItems:"center",justifyContent:"center",color:ic}}>{icon}</div><div style={{flex:1}}><div style={{fontSize:15,fontWeight:700}}>{title}</div><div style={{fontSize:12,color:"#8B9DAF",marginTop:2}}>{desc}</div></div><span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:10,background:abg,color:ac}}>{acc}</span></button>))}<button style={{width:"100%",padding:"16px 20px",background:"#F7F5F0",border:"2px solid #4A7C28",borderRadius:16,marginBottom:10,display:"flex",alignItems:"center",gap:14,cursor:"pointer",textAlign:"left"}} onClick={()=>setAddMethod("manual")}><div style={{width:44,height:44,borderRadius:12,background:"#F7F5F0",display:"flex",alignItems:"center",justifyContent:"center"}}>{Icons.plus}</div><div><div style={{fontSize:15,fontWeight:700}}>{t.addManually}</div><div style={{fontSize:12,color:"#8B9DAF",marginTop:2}}>{t.addManuallyDesc}</div></div></button><button style={{...S.b2,marginTop:8}} onClick={()=>setShowAdd(false)}>{t.cancel}</button></>):(<><button style={{display:"flex",alignItems:"center",gap:6,border:"none",background:"none",color:"#2D2A26",fontSize:14,fontWeight:600,cursor:"pointer",padding:0,marginBottom:12}} onClick={()=>setAddMethod(null)}>{Icons.back} {t.back}</button><p style={{fontSize:20,fontWeight:800,marginBottom:20,textAlign:"center"}}>{t.addItem}</p><div style={{display:"flex",flexDirection:"column",gap:12}}><input style={S.inp} placeholder={t.itemName} value={form.name} onChange={e=>setForm({...form,name:e.target.value})}/><div style={{display:"flex",gap:8}}><input style={{...S.inp,flex:2}} type="number" placeholder={t.quantity} value={form.qty} onChange={e=>setForm({...form,qty:e.target.value})}/><select style={{...S.inp,flex:1}} value={form.unit} onChange={e=>setForm({...form,unit:e.target.value})}><option value="g">g</option><option value="ml">ml</option><option value="pcs">pcs</option></select></div><select style={S.inp} value={form.category} onChange={e=>setForm({...form,category:e.target.value})}>{Object.entries(CATEGORIES).map(([k,v])=>(<option key={k} value={k}>{v.emoji} {v.label[lang]||v.label.en}</option>))}</select><div><label style={{fontSize:12,fontWeight:700,color:"#8B9DAF",marginBottom:4,display:"block"}}>{t.expiresIn}</label><input style={S.inp} type="number" value={form.expiresIn} onChange={e=>setForm({...form,expiresIn:parseInt(e.target.value)||7})}/></div><button style={S.b1} onClick={addItem}>{t.addToFridgeBtn}</button></div></>)}</div></div>)};
   const renderShopModal=()=>{if(!showShop)return null;return(<div style={S.modal} onClick={e=>e.target===e.currentTarget&&setShowShop(false)}><div style={S.mc}><p style={{fontSize:20,fontWeight:800,marginBottom:20,textAlign:"center"}}>🛒 {t.shopList}</p>{shopList.length===0?<p style={{textAlign:"center",color:"#8B9DAF",fontSize:14}}>{t.shopEmpty}</p>:<>{shopList.map((item,i)=>(<div key={i} style={S.row}><span style={{fontSize:14,fontWeight:700,flex:1}}>{item}</span><button style={{border:"none",background:"none",color:"#ccc",cursor:"pointer",padding:4,display:"flex"}} onClick={()=>setShopList(shopList.filter((_,j)=>j!==i))}>{Icons.x}</button></div>))}<button style={{...S.b2,marginTop:16}} onClick={()=>{setShopList([]);show(t.shopCleared)}}>{t.clearAll}</button></>}<button style={{...S.b1,marginTop:10}} onClick={()=>setShowShop(false)}>{t.done}</button></div></div>)};
 
-  return(<div style={S.app}><link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/>{screen==="home"&&renderHome()}{screen==="recipes"&&renderRecipes()}{screen==="alerts"&&renderAlerts()}{screen==="settings"&&renderSettings()}<button style={S.fab} onClick={()=>setShowAdd(true)}>{Icons.plus}</button><div style={S.nav}>{[["home",Icons.home,t.fridge],["recipes",Icons.chef,t.recipes],["alerts",Icons.ai,t.alerts],["settings",Icons.gear,t.settings]].map(([id,icon,label])=>(<button key={id} style={{...S.ni,color:screen===id?"#4A7C28":"#C4B9A8"}} onClick={()=>setScreen(id)}>{icon}<span>{label}</span></button>))}<button style={{...S.ni,color:"#C4B9A8",position:"relative"}} onClick={()=>setShowShop(true)}>🛒<span>{t.shop}</span>{shopList.length>0&&<div style={{position:"absolute",top:-4,right:-4,width:18,height:18,borderRadius:9,background:"#E85D4A",color:"white",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center"}}>{shopList.length}</div>}</button></div>{renderAddModal()}{renderShopModal()}{notif&&<div style={S.notif}>{notif}</div>}</div>);
+  return(<div style={S.app}><link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800;900&display=swap" rel="stylesheet"/><input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{display:"none"}} />{screen==="home"&&renderHome()}{screen==="recipes"&&renderRecipes()}{screen==="alerts"&&renderAlerts()}{screen==="settings"&&renderSettings()}<button style={S.fab} onClick={()=>setShowAdd(true)}>{Icons.plus}</button><div style={S.nav}>{[["home",Icons.home,t.fridge],["recipes",Icons.chef,t.recipes],["alerts",Icons.ai,t.alerts],["settings",Icons.gear,t.settings]].map(([id,icon,label])=>(<button key={id} style={{...S.ni,color:screen===id?"#4A7C28":"#C4B9A8"}} onClick={()=>setScreen(id)}>{icon}<span>{label}</span></button>))}<button style={{...S.ni,color:"#C4B9A8",position:"relative"}} onClick={()=>setShowShop(true)}>🛒<span>{t.shop}</span>{shopList.length>0&&<div style={{position:"absolute",top:-4,right:-4,width:18,height:18,borderRadius:9,background:"#E85D4A",color:"white",fontSize:10,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center"}}>{shopList.length}</div>}</button></div>{renderAddModal()}{renderShopModal()}{notif&&<div style={S.notif}>{notif}</div>}</div>);
 }

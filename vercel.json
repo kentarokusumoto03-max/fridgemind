@@ -1,0 +1,14 @@
+{
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
+  ],
+  "functions": {
+    "api/scan.js": {
+      "maxDuration": 30
+    },
+    "api/barcode.js": {
+      "maxDuration": 10
+    }
+  }
+}
